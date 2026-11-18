@@ -129,24 +129,28 @@ FONT = {
 }
 
 # ---------------------------------------------------------------- canvas
+# Supersampling: draw at SS x resolution, then average each SS x SS block
+# down to 1024. Smooths edges (anti-aliasing) while staying pure stdlib
+# and fully deterministic. Logical coordinates stay 1024-based throughout.
+SS = 2
+
 class Canvas:
     def __init__(self, w, h, bg):
         self.w, self.h = w, h
-        self.buf = bytearray(bytes(bg) * (w * h))
+        self.sw, self.sh = w * SS, h * SS
+        self.buf = bytearray(bytes(bg) * (self.sw * self.sh))
 
     def px(self, x, y, c):
-        if 0 <= x < self.w and 0 <= y < self.h:
-            i = (y * self.w + x) * 3
-            self.buf[i], self.buf[i + 1], self.buf[i + 2] = c
+        self.rect(x, y, 1, 1, c)
 
     def rect(self, x, y, w, h, c):
-        x0, y0 = max(0, x), max(0, y)
-        x1, y1 = min(self.w, x + w), min(self.h, y + h)
+        x0, y0 = max(0, x * SS), max(0, y * SS)
+        x1, y1 = min(self.sw, (x + w) * SS), min(self.sh, (y + h) * SS)
         if x1 <= x0 or y1 <= y0:
             return
         row = bytes(c) * (x1 - x0)
         for yy in range(y0, y1):
-            i = (yy * self.w + x0) * 3
+            i = (yy * self.sw + x0) * 3
             self.buf[i:i + len(row)] = row
 
     def hline(self, x, y, w, c, th=1):
@@ -155,15 +159,28 @@ class Canvas:
     def vline(self, x, y, h, c, th=1):
         self.rect(x, y, th, h, c)
 
+    def rect_hr(self, x, y, w, h, c):
+        """Filled rect in device (supersampled) coordinates."""
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(self.sw, x + w), min(self.sh, y + h)
+        if x1 <= x0 or y1 <= y0:
+            return
+        row = bytes(c) * (x1 - x0)
+        for yy in range(y0, y1):
+            i = (yy * self.sw + x0) * 3
+            self.buf[i:i + len(row)] = row
+
     def line(self, x0, y0, x1, y1, c, th=1):
+        # Rasterize in device space so diagonals and curves anti-alias
+        # when the canvas is averaged down. Accepts float coordinates.
+        x0, y0, x1, y1 = (int(round(v * SS)) for v in (x0, y0, x1, y1))
+        thd = max(1, int(round(th * SS)))
         dx, dy = abs(x1 - x0), abs(y1 - y0)
         sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
         err = dx - dy
+        h = thd // 2
         while True:
-            if th == 1:
-                self.px(x0, y0, c)
-            else:
-                self.rect(x0 - th // 2, y0 - th // 2, th, th, c)
+            self.rect_hr(x0 - h, y0 - h, thd, thd, c)
             if x0 == x1 and y0 == y1:
                 break
             e2 = 2 * err
@@ -175,34 +192,39 @@ class Canvas:
                 y0 += sy
 
     def circle_fill(self, cx, cy, r, c):
-        for yy in range(cy - r, cy + r + 1):
+        cx, cy, r = cx * SS, cy * SS, r * SS
+        for yy in range(int(cy - r), int(cy + r) + 1):
             dx = int(math.sqrt(max(0, r * r - (yy - cy) ** 2)))
-            self.rect(cx - dx, yy, 2 * dx + 1, 1, c)
+            self.rect_hr(int(cx - dx), yy, 2 * dx + 1, 1, c)
 
     def circle_ring(self, cx, cy, r, c, th=1):
+        cx, cy, r = cx * SS, cy * SS, r * SS
+        thd = max(1, int(round(th * SS)))
         steps = max(24, int(2 * math.pi * r))
+        h = thd // 2
         for i in range(steps):
             a = 2 * math.pi * i / steps
-            self.rect(int(round(cx + r * math.cos(a))) - th // 2,
-                      int(round(cy + r * math.sin(a))) - th // 2, th, th, c)
+            self.rect_hr(int(round(cx + r * math.cos(a))) - h,
+                         int(round(cy + r * math.sin(a))) - h, thd, thd, c)
 
     def arc(self, cx, cy, r, a0, a1, c, th=1):
-        steps = max(8, int(abs(a1 - a0) * r / 2))
+        steps = max(8, int(abs(a1 - a0) * r * SS / 2))
         prev = None
         for i in range(steps + 1):
             a = a0 + (a1 - a0) * i / steps
-            p = (int(round(cx + r * math.cos(a))),
-                 int(round(cy + r * math.sin(a))))
+            p = (cx + r * math.cos(a), cy + r * math.sin(a))
             if prev is not None:
                 self.line(prev[0], prev[1], p[0], p[1], c, th)
             prev = p
 
     def polygon(self, pts, c):
-        """Filled polygon via scanline (even-odd)."""
+        """Filled polygon via scanline (even-odd), rasterized in
+        device space so slanted edges anti-alias."""
         if len(pts) < 3:
             return
+        pts = [(x * SS, y * SS) for x, y in pts]
         ys = [p[1] for p in pts]
-        for yy in range(min(ys), max(ys) + 1):
+        for yy in range(int(min(ys)), int(max(ys)) + 1):
             xs = []
             n = len(pts)
             for i in range(n):
@@ -213,7 +235,7 @@ class Canvas:
             xs.sort()
             for i in range(0, len(xs) - 1, 2):
                 xa = int(math.ceil(xs[i]))
-                self.rect(xa, yy, max(1, int(xs[i + 1]) - xa), 1, c)
+                self.rect_hr(xa, yy, max(1, int(xs[i + 1]) - xa), 1, c)
 
     def polyline(self, pts, c, th=1):
         for i in range(len(pts) - 1):
@@ -277,11 +299,22 @@ def draw_wrapped(cv, x, y, s, scale, color, max_w, line_h, bold=False,
 
 # ---------------------------------------------------------------- PNG out
 def write_png(path, cv):
+    # Average each SS x SS block of the supersampled canvas down to one
+    # output pixel. Integer math only: same input, byte-identical output.
     raw = bytearray()
-    stride = cv.w * 3
+    n = SS * SS
     for yy in range(cv.h):
         raw.append(0)
-        raw += cv.buf[yy * stride:(yy + 1) * stride]
+        for xx in range(cv.w):
+            r = g = b = 0
+            for dy in range(SS):
+                base = ((yy * SS + dy) * cv.sw + xx * SS) * 3
+                for dx in range(SS):
+                    i = base + dx * 3
+                    r += cv.buf[i]
+                    g += cv.buf[i + 1]
+                    b += cv.buf[i + 2]
+            raw += bytes((r // n, g // n, b // n))
     comp = zlib.compress(bytes(raw), 9)
 
     def chunk(typ, data):
@@ -553,8 +586,8 @@ CARD_X = [10, 262, 514, 766]
 CARD_Y = [146, 330, 514]
 
 def draw_masthead(cv):
-    draw_text(cv, W // 2, 8, "THE WORLD TODAY", 5, INK, bold=True,
-              spacing=8, align="center")
+    draw_stroke_text(cv, W // 2, 6, "THE WORLD TODAY", 2.4, 5, INK,
+                     spacing=6, align="center")
     draw_text(cv, W // 2, 48, "ONE DAY OF WORLD NEWS, IN FULL", 1, INK,
               spacing=2, align="center")
     cv.hline(10, 60, 1004, INK, 2)
@@ -562,10 +595,10 @@ def draw_masthead(cv):
 
 def draw_banner(cv):
     cv.rect(10, 66, 1004, 72, NAVY)
-    draw_text(cv, W // 2, 74, "WEDNESDAY 18 NOVEMBER 2026", 4, CARD,
-              bold=True, spacing=3, align="center")
-    draw_text(cv, W // 2, 110, "34 STORIES | 6 CONTINENTS | ONE DAY",
-              2, GOLD, bold=True, spacing=2, align="center")
+    draw_stroke_text(cv, W // 2, 74, "WEDNESDAY 18 NOVEMBER 2026", 1.75,
+                     3.5, CARD, spacing=3, align="center")
+    draw_stroke_text(cv, W // 2, 110, "34 STORIES | 6 CONTINENTS | ONE DAY",
+                     1.0, 2.5, GOLD, spacing=2, align="center")
 
 def draw_card(cv, story):
     num, cat, kicker, headline, deck, _lo, _la, _nx, _ny = story
@@ -586,8 +619,9 @@ def draw_card(cv, story):
               spacing=1, align="center")
     # kicker, headline, deck
     draw_text(cv, x + 8, y + 74, kicker, 1, col, spacing=2)
-    draw_wrapped(cv, x + 8, y + 88, headline, 2, INK, CARD_W - 16, 17,
-                 bold=True, spacing=2, max_lines=2)
+    display = headline.upper().replace(",", "").replace(":", "")
+    draw_stroke_wrapped(cv, x + 8, y + 88, display, 1.0, 2.5, INK,
+                        CARD_W - 16, 18, spacing=0, max_lines=2)
     draw_wrapped(cv, x + 8, y + 126, deck, 1, INK, CARD_W - 16, 10,
                  spacing=1, max_lines=4)
 
@@ -598,8 +632,8 @@ def draw_map_panel(cv):
     cv.rect(x0, y0 + h - 1, w, 1, BORDER)
     cv.rect(x0, y0, 1, h, BORDER)
     cv.rect(x0 + w - 1, y0, 1, h, BORDER)
-    draw_text(cv, x0 + 10, y0 + 8, "WHERE IT HAPPENED", 2, INK, bold=True,
-              spacing=1)
+    draw_stroke_text(cv, x0 + 10, y0 + 8, "WHERE IT HAPPENED", 1.0, 2.5,
+                     INK, spacing=1)
     draw_text(cv, x0 + w - 10, y0 + 11, "34 STORIES MAPPED", 1, DOTGRAY,
               spacing=1, align="right")
     mx, my, mw, mh = x0 + 4, y0 + 30, w - 8, 190
@@ -652,8 +686,8 @@ def draw_also_panel(cv):
     cv.rect(x0, y0 + h - 1, w, 1, BORDER)
     cv.rect(x0, y0, 1, h, BORDER)
     cv.rect(x0 + w - 1, y0, 1, h, BORDER)
-    draw_text(cv, x0 + 10, y0 + 8, "ALSO ON 18 NOVEMBER (13-34)", 2, INK,
-              bold=True, spacing=1)
+    draw_stroke_text(cv, x0 + 10, y0 + 8, "ALSO ON 18 NOVEMBER (13-34)",
+                     1.0, 2.5, INK, spacing=1)
     cols = [x0 + 10, x0 + 266]
     for i, item in enumerate(ALSO):
         num, cat, text = item[0], item[1], item[2]
@@ -710,6 +744,179 @@ def render_fonttest():
               "dog. 11,000+ cases, 5,400 deaths.", 1, INK, spacing=1)
     return cv
 
+# ---------------------------------------------------------------- stroke font
+# Display lettering: glyphs as strokes on a 12 x 16 grid, rasterized
+# through the device-space line/arc primitives so edges anti-alias.
+# Used for masthead, date banner, headlines and panel headers (caps only).
+# Small text keeps the crisp 5x7 bitmap font.
+HALF_PI = math.pi / 2
+TWO_PI = 2 * math.pi
+
+def _S(pts):
+    return ("l", tuple(pts))
+
+def _E(cx, cy, rx, ry, a0, a1):
+    return ("e", (cx, cy, rx, ry, a0, a1))
+
+_S_SHAPE = [(9.5, 2.5), (7, 1), (4, 1.5), (2.5, 3.5), (3, 6), (5.5, 8),
+            (7, 8), (9.5, 10), (9.5, 13), (7, 15), (4, 15), (2, 13)]
+
+STROKES = {
+    " ": [],
+    "A": [_S([(1, 15), (6, 1), (11, 15)]), _S([(3.4, 10.5), (8.6, 10.5)])],
+    "B": [_S([(1.5, 15), (1.5, 1), (7, 1)]),
+          _E(7, 4.75, 3.5, 3.75, -HALF_PI, HALF_PI),
+          _E(7, 11, 4, 4, -HALF_PI, HALF_PI),
+          _S([(1.5, 15), (7, 15)]), _S([(1.5, 8), (6.5, 8)])],
+    "C": [_E(6, 8, 5, 7, 0.65, TWO_PI - 0.65)],
+    "D": [_S([(1.5, 15), (1.5, 1), (6, 1)]),
+          _E(6, 8, 5, 7, -HALF_PI, HALF_PI), _S([(1.5, 15), (6, 15)])],
+    "E": [_S([(10, 1), (1.5, 1), (1.5, 15), (10, 15)]),
+          _S([(1.5, 8), (8, 8)])],
+    "F": [_S([(1.5, 15), (1.5, 1), (10, 1)]), _S([(1.5, 8), (8, 8)])],
+    "G": [_E(6, 8, 5, 7, 0.65, TWO_PI - 0.85),
+          _S([(11, 7.5), (6.5, 7.5)]), _S([(11, 7.5), (11, 12)])],
+    "H": [_S([(1.5, 1), (1.5, 15)]), _S([(10.5, 1), (10.5, 15)]),
+          _S([(1.5, 8), (10.5, 8)])],
+    "I": [_S([(6, 1), (6, 15)]), _S([(3, 1), (9, 1)]), _S([(3, 15), (9, 15)])],
+    "J": [_S([(4, 1), (10, 1)]), _S([(9.5, 1), (9.5, 11)]),
+          _E(6, 11, 3.5, 4, 0, math.pi)],
+    "K": [_S([(1.5, 1), (1.5, 15)]), _S([(10, 1), (2.5, 8)]),
+          _S([(4.5, 6), (10.5, 15)])],
+    "L": [_S([(1.5, 1), (1.5, 15), (10.5, 15)])],
+    "M": [_S([(1.5, 15), (1.5, 1), (6, 8.5), (10.5, 1), (10.5, 15)])],
+    "N": [_S([(1.5, 15), (1.5, 1), (10.5, 15), (10.5, 1)])],
+    "O": [_E(6, 8, 5, 7, 0, TWO_PI)],
+    "P": [_S([(1.5, 15), (1.5, 1), (7, 1)]),
+          _E(7, 4.75, 3.5, 3.75, -HALF_PI, HALF_PI),
+          _S([(1.5, 8.5), (7, 8.5)])],
+    "Q": [_E(6, 8, 5, 7, 0, TWO_PI), _S([(8, 12.5), (11.5, 16)])],
+    "R": [_S([(1.5, 15), (1.5, 1), (7, 1)]),
+          _E(7, 4.75, 3.5, 3.75, -HALF_PI, HALF_PI),
+          _S([(1.5, 8.5), (7, 8.5)]), _S([(5, 8.5), (11, 15)])],
+    "S": [_S(_S_SHAPE)],
+    "T": [_S([(1, 1), (11, 1)]), _S([(6, 1), (6, 15)])],
+    "U": [_S([(1.5, 1), (1.5, 10.5)]), _E(6, 10.5, 4.5, 4.5, 0, math.pi),
+          _S([(10.5, 1), (10.5, 10.5)])],
+    "V": [_S([(1, 1), (6, 15), (11, 1)])],
+    "W": [_S([(1, 1), (3, 15), (6, 8), (9, 15), (11, 1)])],
+    "X": [_S([(1.5, 1), (10.5, 15)]), _S([(10.5, 1), (1.5, 15)])],
+    "Y": [_S([(1.5, 1), (6, 8), (10.5, 1)]), _S([(6, 8), (6, 15)])],
+    "Z": [_S([(1.5, 1), (10.5, 1), (1.5, 15), (10.5, 15)])],
+    "0": [_E(6, 8, 5, 7, 0, TWO_PI), _S([(3.5, 3.5), (8.5, 12.5)])],
+    "1": [_S([(4, 3.5), (6.5, 1), (6.5, 15)]), _S([(3.5, 15), (9.5, 15)])],
+    "2": [_S([(2, 5), (2, 3), (4, 1), (8, 1), (10, 3), (10, 5.5),
+               (1.5, 15), (10.5, 15)])],
+    "3": [_E(6, 4.75, 3.5, 3.75, -1.35, 1.35),
+          _E(6, 11, 4, 4, -1.35, 1.35), _S([(2.5, 1.5), (5.5, 1)])],
+    "4": [_S([(8, 1), (1.5, 10.5), (10.5, 10.5)]), _S([(8, 1), (8, 15)])],
+    "5": [_S([(10, 1), (2, 1), (2, 8), (8.5, 8)]),
+          _E(6.5, 11.5, 3.5, 3.5, -HALF_PI, HALF_PI)],
+    "6": [_E(6, 10.5, 4.5, 4.5, 0.5, TWO_PI),
+          _S([(10, 1.5), (6, 3), (3, 7)])],
+    "7": [_S([(1.5, 1), (10.5, 1), (5, 15)])],
+    "8": [_E(6, 4.5, 4, 3.5, 0, TWO_PI), _E(6, 11, 4.5, 4, 0, TWO_PI)],
+    "9": [_E(6, 5.5, 4.5, 4.5, 0, TWO_PI),
+          _S([(10.5, 6), (10.5, 12), (8, 15), (4, 15)])],
+    "$": [_S(_S_SHAPE), _S([(6, 0), (6, 16)])],
+    ".": [("d", (6, 14, 1.3))],
+    "-": [_S([(2, 8), (10, 8)])],
+    "/": [_S([(9, 15), (3, 1)])],
+    "(": [_E(8.5, 8, 4, 7, HALF_PI, 3 * HALF_PI)],
+    ")": [_E(3.5, 8, 4, 7, -HALF_PI, HALF_PI)],
+    "|": [_S([(6, 1), (6, 15)])],
+    "?": [_S([(2, 3), (3, 1), (6, 1), (9, 2), (9, 4), (6, 7), (6, 9)]),
+          ("d", (6, 13, 1.3))],
+}
+
+STROKE_ADV = 12  # grid units per character cell
+
+def draw_stroke_char(cv, x, y, ch, scale, weight, color):
+    for stroke in STROKES.get(ch, STROKES["?"]):
+        kind, data = stroke[0], stroke[1]
+        if kind == "l":
+            pts = [(x + px * scale, y + py * scale) for px, py in data]
+            for i in range(len(pts) - 1):
+                cv.line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1],
+                        color, weight)
+        elif kind == "e":
+            cx, cy, rx, ry, a0, a1 = data
+            steps = max(12, int(abs(a1 - a0) * max(rx, ry) * scale))
+            prev = None
+            for i in range(steps + 1):
+                a = a0 + (a1 - a0) * i / steps
+                p = (x + (cx + rx * math.cos(a)) * scale,
+                     y + (cy + ry * math.sin(a)) * scale)
+                if prev is not None:
+                    cv.line(prev[0], prev[1], p[0], p[1], color, weight)
+                prev = p
+        elif kind == "d":
+            dx, dy, r = data
+            cv.circle_fill(x + dx * scale, y + dy * scale, r * scale, color)
+
+def stroke_text_w(s, scale, spacing):
+    if not s:
+        return 0
+    return len(s) * (STROKE_ADV * scale + spacing) - spacing
+
+def draw_stroke_text(cv, x, y, s, scale, weight, color, spacing=1,
+                     align="left"):
+    w = stroke_text_w(s, scale, spacing)
+    if align == "center":
+        x = x - w / 2
+    elif align == "right":
+        x = x - w
+    cx = x
+    for ch in s:
+        draw_stroke_char(cv, cx, y, ch, scale, weight, color)
+        cx += STROKE_ADV * scale + spacing
+    return w
+
+def wrap_stroke(s, scale, spacing, max_w):
+    words = s.split(" ")
+    lines, cur = [], ""
+    for wd in words:
+        trial = wd if not cur else cur + " " + wd
+        if stroke_text_w(trial, scale, spacing) <= max_w or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = wd
+    if cur:
+        lines.append(cur)
+    return lines
+
+def draw_stroke_wrapped(cv, x, y, s, scale, weight, color, max_w, line_h,
+                        spacing=1, max_lines=None):
+    lines = wrap_stroke(s, scale, spacing, max_w)
+    if max_lines is not None:
+        lines = lines[:max_lines]
+    for i, ln in enumerate(lines):
+        draw_stroke_text(cv, x, y + i * line_h, ln, scale, weight, color,
+                         spacing)
+    return len(lines)
+
+def render_stroketest():
+    cv = Canvas(W, H, CARD)
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789$. -/|()?"
+    x, y = 20, 30
+    for ch in chars:
+        draw_stroke_char(cv, x, y, ch, 2.0, 4, INK)
+        x += 34
+        if x > W - 60:
+            x, y = 20, y + 50
+    draw_stroke_text(cv, 20, y + 60, "THE WORLD TODAY", 2.4, 5, INK,
+                     spacing=6)
+    draw_stroke_text(cv, 20, y + 110, "WEDNESDAY 18 NOVEMBER 2026", 1.75,
+                     3.5, NAVY, spacing=3)
+    draw_stroke_text(cv, 20, y + 150, "IRAN STRIKES BACK AT BAHRAIN KUWAIT",
+                     1.0, 2.2, INK, spacing=0)
+    draw_stroke_text(cv, 20, y + 175, "NVIDIA RECORD $115.8BN QUARTER",
+                     1.0, 2.2, INK, spacing=0)
+    draw_stroke_text(cv, 20, y + 200, "34 STORIES | 6 CONTINENTS | ONE DAY",
+                     1.0, 2.2, GOLD, spacing=2)
+    return cv
+
 def main():
     outdir = os.environ.get("MAKEFUN_OUTPUT_DIR")
     if not outdir:
@@ -717,6 +924,8 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     if os.environ.get("FONTTEST") == "1":
         cv = render_fonttest()
+    elif os.environ.get("STROKETEST") == "1":
+        cv = render_stroketest()
     else:
         cv = render_page()
     path = os.path.join(outdir, "entry.png")
